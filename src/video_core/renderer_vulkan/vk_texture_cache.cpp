@@ -172,13 +172,13 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
 // GB of R8/RG16/R16 that stay empty in the attract demo) is all zeros: it gets no device memory
 // until a write makes the texture cache replace it.
-[[nodiscard]] bool IsUnwrittenSparse(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (!device.CanUseUnbackedSparseImages()) {
-        return false;
-    }
-    constexpr u32 MinSize = 32U << 20;
+// Exclude B10G11R11_FLOAT render targets (e.g. 512x512x101 irradiance arrays at 0x81605f0000)
+// and raise MinSize to 200 MiB so GPU-written render targets are backed immediately.
+[[nodiscard]] bool IsUnwrittenSparse(const ImageInfo& info, GPUVAddr gpu_addr) {
+    constexpr u32 MinSize = 200U << 20;
     const u32 size = VideoCommon::CalculateGuestSizeInBytes(info);
-    return size >= MinSize && info.type != ImageType::e1D && info.type != ImageType::Buffer &&
+    return size >= MinSize && info.format != PixelFormat::B10G11R11_FLOAT &&
+           info.type != ImageType::e1D && info.type != ImageType::Buffer &&
            info.type != ImageType::Linear && Tegra::Nx2SparseUnwritten(gpu_addr, size);
 }
 
@@ -187,8 +187,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // Image::BindLayers. Only formats uploaded layer by layer: huge ASTC arrays (GPU decode) and
 // formats the host samples as they are.
 [[nodiscard]] bool UsesSparseLayers(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (!device.CanUseUnbackedSparseImages() || !device.IsSparseResidencyImage2DSupported() ||
-        info.type != ImageType::e2D ||
+    if (!device.IsSparseResidencyImage2DSupported() || info.type != ImageType::e2D ||
         info.resources.layers <= 1 || info.num_samples != 1 ||
         VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
         return false;
@@ -201,54 +200,16 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     return layer_uploads && size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
 }
 
-// How SparseTiles images leave the blocks without data: unbound (reads give zero), or all bound to
-// one zeroed block where the driver can't sample unbound memory (AMD) but lets blocks share
-// memory. EDEN_NX2_SPARSE_ALIASED=1 takes the shared block wherever it is supported, =0 never.
-enum class SparseTilesMode {
-    None,
-    Unbound,
-    Aliased,
-};
-
-[[nodiscard]] SparseTilesMode SparseTilesModeOf(const Device& device) {
-    static const char force_aliased = [] {
-        const char* value = std::getenv("EDEN_NX2_SPARSE_ALIASED");
-        return value == nullptr ? '\0' : value[0];
-    }();
-    if (!device.IsSparseResidencyImage2DSupported()) {
-        return SparseTilesMode::None;
-    }
-    const bool aliased = device.IsSparseResidencyAliasedSupported() && force_aliased != '0';
-    if (aliased && force_aliased == '1') {
-        return SparseTilesMode::Aliased;
-    }
-    if (device.CanUseUnbackedSparseImages()) {
-        return SparseTilesMode::Unbound;
-    }
-    return aliased ? SparseTilesMode::Aliased : SparseTilesMode::None;
-}
-
-// A large single 2D image in a Switch 2 sparse region (title 1's world-sized R8/RG16/R16 masks,
-// 170-341 MB, of which the game maps a few MiB) gets memory by sparse block where the guest memory
-// under it can hold data: unbacked at first, then Image::BindTiles. Formats of one texel per
-// block that the host samples as they are.
-[[nodiscard]] bool UsesSparseTiles(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (SparseTilesModeOf(device) == SparseTilesMode::None || info.type != ImageType::e2D || info.resources.layers != 1 || info.num_samples != 1 ||
-        info.size.depth != 1 || info.block.width != 0 ||
-        VideoCore::Surface::DefaultBlockWidth(info.format) != 1 ||
-        VideoCore::Surface::DefaultBlockHeight(info.format) != 1 ||
-        VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
-        return false;
-    }
-    const u32 size = VideoCommon::CalculateGuestSizeInBytes(info);
-    return size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
-}
-
-// The most device memory one SparseLayers image binds: 768 MiB, 384 MiB on GPUs with less than
-// 7 GiB (title 1's BC6H arrays are 85 MB a layer).
+// The most device memory one SparseLayers image binds: 2048 MiB on >=10 GiB GPUs (so 68-layer
+// BC6H terrain arrays at 85 MiB/layer do not run out of memory after 8 layers), 768 MiB on 8 GiB,
+// and 384 MiB on GPUs with less than 7 GiB.
 [[nodiscard]] VkDeviceSize SparseLayersCap(const Device& device) {
-    return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (VkDeviceSize{384} << 20)
-                                                           : (VkDeviceSize{768} << 20);
+    const u64 local_mem = device.GetDeviceLocalMemory();
+    if (local_mem >= (u64{10} << 30)) {
+        return VkDeviceSize{2048} << 20;
+    }
+    return local_mem < (u64{7} << 30) ? (VkDeviceSize{384} << 20)
+                                       : (VkDeviceSize{768} << 20);
 }
 
 // The host format of a huge ASTC array: the GPU decoder's RGBA8 (sRGB kept for sampling).
@@ -396,7 +357,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
-                                  bool unbacked = false, bool aliased = false) {
+                                  bool unbacked = false) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -425,7 +386,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         }
     }
     if (unbacked) {
-        if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
+        if (vk::Image image = allocator.CreateUnbackedImage(image_ci)) {
             return image;
         }
     }
@@ -1142,7 +1103,8 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
     const u64 budget = device.GetDeviceMemoryBudget();
     const u64 memory = budget != 0 ? budget : device.GetDeviceLocalMemory();
     const char* keep = std::getenv("EDEN_NX2_KEEP_ASTC");
-    if (memory >= 12_GiB || (keep != nullptr && keep[0] == '1')) {
+    // A 12 GB card reports ~11.0-11.3 GiB budget under Windows WDDM; use 10_GiB threshold
+    if (memory >= 10_GiB || (keep != nullptr && keep[0] == '1')) {
         return;
     }
     LOG_WARNING(Render_Vulkan,
@@ -2136,10 +2098,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    : runtime->ViewFormats(info.format),
                                AstcHostFormat(runtime_.device, info),
                                UsesSparseLayers(runtime_.device, info, gpu_addr_) ||
-                                   UsesSparseTiles(runtime_.device, info, gpu_addr_) ||
-                                   IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
-                               UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
-                                   SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased)),
+                                   IsUnwrittenSparse(info, gpu_addr_))),
       aspect_mask(ImageAspectMask(info.format)) {
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
@@ -2148,8 +2107,6 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
         if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
             flags |= VideoCommon::ImageFlagBits::SparseLayers;
-        } else if (UsesSparseTiles(runtime_.device, info, gpu_addr_) && InitSparseTiles()) {
-            flags |= VideoCommon::ImageFlagBits::SparseTiles;
         } else if (texels <= (u64{1} << 28)) {
             // Not too big to back (see MemoryAllocator::CreateImage): unbacked because nothing
             // was written there yet, so the first write gets it replaced.
@@ -2678,381 +2635,6 @@ bool Image::InitSparseLayers() {
              "Sparse layered image {:#x}: {}x{} {} levels {} layers, {} KiB a layer, block {}x{}",
              gpu_addr, s.width, s.height, s.levels, info.resources.layers, s.layer_bytes >> 10,
              s.tile_width, s.tile_height);
-    return true;
-}
-
-bool Image::InitSparseTiles() {
-    const Device& device = runtime->device;
-    const VkImage handle = *original_image;
-    const auto requirements = device.GetLogical().GetImageSparseMemoryRequirements(handle);
-    const auto it = std::ranges::find_if(requirements, [](const auto& r) {
-        return (r.formatProperties.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
-    });
-    if (it == requirements.end()) {
-        return false;
-    }
-    SparseLayerMemory& s = sparse_layers;
-    s.requirements = device.GetLogical().GetImageMemoryRequirements(handle);
-    const VkExtent3D granularity = it->formatProperties.imageGranularity;
-    const u32 bytes = VideoCore::Surface::BytesPerBlock(info.format);
-    // Rectangles are uploaded by whole GOB columns (64 bytes across).
-    if (granularity.width == 0 || granularity.height == 0 || (granularity.width * bytes) % 64 != 0 ||
-        u64{granularity.width} * granularity.height * bytes != s.requirements.alignment) {
-        return false;
-    }
-    s.allocator = &runtime->memory_allocator;
-    s.sparse = *it;
-    s.width = info.size.width;
-    s.height = info.size.height;
-    s.levels = static_cast<u32>(info.resources.levels);
-    s.tile_width = granularity.width;
-    s.tile_height = granularity.height;
-    s.tail_level = (std::min)(it->imageMipTailFirstLod, s.levels);
-    s.level_tiles.resize(s.tail_level);
-    for (u32 level = 0; level < s.tail_level; ++level) {
-        const u32 width = (std::max)(s.width >> level, 1U);
-        const u32 height = (std::max)(s.height >> level, 1U);
-        s.level_tiles[level].assign(
-            size_t{Common::DivCeil(width, s.tile_width)} * Common::DivCeil(height, s.tile_height),
-            VK_NULL_HANDLE);
-    }
-    if (SparseTilesModeOf(device) == SparseTilesMode::Aliased && !BindZeroBlock()) {
-        LOG_WARNING(Render_Vulkan, "Sparse tiled image {:#x}: no zeroed block to share", gpu_addr);
-        s.Release();
-        s.allocator = nullptr;
-        s.bound_bytes = 0;
-        return false;
-    }
-    LOG_INFO(Render_Vulkan, "Sparse tiled image {:#x}: {}x{} {} levels, block {}x{}, mip tail from {}{}",
-             gpu_addr, s.width, s.height, s.levels, s.tile_width, s.tile_height, s.tail_level,
-             s.zero_block != VK_NULL_HANDLE ? ", empty blocks share a zeroed one" : "");
-    return true;
-}
-
-bool Image::BindZeroBlock() {
-    SparseLayerMemory& s = sparse_layers;
-    const Device& device = runtime->device;
-    const u64 tile = s.requirements.alignment;
-    VkDeviceMemory memory{};
-    VkDeviceSize offset{};
-    s.zero_block = s.allocator->AllocateSparseMemory(
-        VkMemoryRequirements{
-            .size = tile,
-            .alignment = tile,
-            .memoryTypeBits = s.requirements.memoryTypeBits,
-        },
-        memory, offset);
-    if (s.zero_block == VK_NULL_HANDLE) {
-        return false;
-    }
-    s.bound_bytes += tile;
-    std::vector<VkSparseImageMemoryBind> image_binds;
-    for (u32 level = 0; level < s.tail_level; ++level) {
-        const u32 width = (std::max)(s.width >> level, 1U);
-        const u32 height = (std::max)(s.height >> level, 1U);
-        for (u32 y = 0; y < height; y += s.tile_height) {
-            for (u32 x = 0; x < width; x += s.tile_width) {
-                image_binds.push_back(VkSparseImageMemoryBind{
-                    .subresource{
-                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .mipLevel = level,
-                        .arrayLayer = 0,
-                    },
-                    .offset{static_cast<s32>(x), static_cast<s32>(y), 0},
-                    .extent{(std::min)(s.tile_width, width - x), (std::min)(s.tile_height, height - y),
-                            1},
-                    .memory = memory,
-                    .memoryOffset = offset,
-                    .flags = 0,
-                });
-            }
-        }
-    }
-    // The mip tail gets memory of its own: it is small, and the clear below zeroes it too.
-    std::vector<VkSparseMemoryBind> opaque_binds;
-    if (s.tail_level < s.levels) {
-        const VkMemoryRequirements requirements{
-            .size = Common::AlignUp(s.sparse.imageMipTailSize, tile),
-            .alignment = tile,
-            .memoryTypeBits = s.requirements.memoryTypeBits,
-        };
-        VkDeviceMemory tail_memory{};
-        VkDeviceSize tail_offset{};
-        s.tail_memory = s.allocator->AllocateSparseMemory(requirements, tail_memory, tail_offset);
-        if (s.tail_memory == VK_NULL_HANDLE) {
-            return false;
-        }
-        s.bound_bytes += requirements.size;
-        opaque_binds.push_back(VkSparseMemoryBind{
-            .resourceOffset = s.sparse.imageMipTailOffset,
-            .size = s.sparse.imageMipTailSize,
-            .memory = tail_memory,
-            .memoryOffset = tail_offset,
-            .flags = 0,
-        });
-    }
-    const VkSparseImageMemoryBindInfo image_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(image_binds.size()),
-        .pBinds = image_binds.data(),
-    };
-    const VkSparseImageOpaqueMemoryBindInfo opaque_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(opaque_binds.size()),
-        .pBinds = opaque_binds.data(),
-    };
-    const VkBindSparseInfo bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .bufferBindCount = 0,
-        .pBufferBinds = nullptr,
-        .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
-        .pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_bind_info,
-        .imageBindCount = image_binds.empty() ? 0U : 1U,
-        .pImageBinds = image_binds.empty() ? nullptr : &image_bind_info,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
-    };
-    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-    });
-    VkResult result;
-    {
-        std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
-    }
-    if (result != VK_SUCCESS) {
-        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding the zeroed block failed ({})",
-                  gpu_addr, static_cast<int>(result));
-        return false;
-    }
-    fence.Wait();
-    // Every block now reads the shared block (and the tail its own memory): zero them all.
-    ClearTiles();
-    return true;
-}
-
-void Image::ClearTiles() {
-    scheduler->RequestOutsideRenderPassOperationContext();
-    const VkImage vk_image = *original_image;
-    const bool was_initialized = std::exchange(initialized, true);
-    scheduler->Record([vk_image, was_initialized](vk::CommandBuffer cmdbuf) {
-        static constexpr VkImageSubresourceRange range{
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = VK_REMAINING_MIP_LEVELS,
-            .baseArrayLayer = 0,
-            .layerCount = VK_REMAINING_ARRAY_LAYERS,
-        };
-        const VkImageMemoryBarrier to_transfer{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                             VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = was_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = vk_image,
-            .subresourceRange = range,
-        };
-        const VkImageMemoryBarrier to_general{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                             VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = vk_image,
-            .subresourceRange = range,
-        };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                               to_transfer);
-        cmdbuf.ClearColorImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VkClearColorValue{},
-                               range);
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
-                               to_general);
-    });
-}
-
-bool Image::BackTilesWhole() {
-    SparseLayerMemory& s = sparse_layers;
-    if (s.zero_block == VK_NULL_HANDLE) {
-        return true;
-    }
-    std::vector<VideoCommon::LevelRect> rects;
-    for (u32 level = 0; level < s.levels; ++level) {
-        rects.push_back({static_cast<s32>(level), 0, 0, (std::max)(s.width >> level, 1U),
-                         (std::max)(s.height >> level, 1U)});
-    }
-    if (!BindTiles(rects)) {
-        return false;
-    }
-    // No block reads the shared one any more.
-    s.allocator->FreeSparseMemory(s.zero_block);
-    s.zero_block = VK_NULL_HANDLE;
-    s.bound_bytes -= s.requirements.alignment;
-    ClearTiles();
-    return true;
-}
-
-bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
-    SparseLayerMemory& s = sparse_layers;
-    if (s.allocator == nullptr) {
-        return false;
-    }
-    const Device& device = runtime->device;
-    const u64 tile = s.requirements.alignment;
-    const VkMemoryRequirements tile_requirements{
-        .size = tile,
-        .alignment = tile,
-        .memoryTypeBits = s.requirements.memoryTypeBits,
-    };
-    std::vector<VkSparseImageMemoryBind> image_binds;
-    std::vector<VkSparseMemoryBind> opaque_binds;
-    std::vector<VmaAllocation*> fresh; // Blocks given memory by this call
-    bool fresh_tail = false;
-    // A failed bind leaves the blocks as they were, so the next call tries them again.
-    const auto roll_back = [&] {
-        for (VmaAllocation* const allocation : fresh) {
-            s.allocator->FreeSparseMemory(*allocation);
-            *allocation = VK_NULL_HANDLE;
-            s.bound_bytes -= tile;
-        }
-        if (fresh_tail) {
-            s.allocator->FreeSparseMemory(s.tail_memory);
-            s.tail_memory = VK_NULL_HANDLE;
-            s.bound_bytes -= Common::AlignUp(s.sparse.imageMipTailSize, tile);
-        }
-    };
-    bool needs_tail = false;
-    for (const VideoCommon::LevelRect& rect : rects) {
-        const u32 level = static_cast<u32>(rect.level);
-        if (level >= s.tail_level) {
-            needs_tail = true;
-            continue;
-        }
-        const u32 width = (std::max)(s.width >> level, 1U);
-        const u32 height = (std::max)(s.height >> level, 1U);
-        const u32 tiles_x = Common::DivCeil(width, s.tile_width);
-        for (u32 ty = rect.y / s.tile_height; ty <= (rect.y + rect.height - 1) / s.tile_height;
-             ++ty) {
-            for (u32 tx = rect.x / s.tile_width; tx <= (rect.x + rect.width - 1) / s.tile_width;
-                 ++tx) {
-                VmaAllocation& allocation = s.level_tiles[level][size_t{ty} * tiles_x + tx];
-                if (allocation != VK_NULL_HANDLE) {
-                    continue;
-                }
-                VkDeviceMemory memory{};
-                VkDeviceSize offset{};
-                allocation = s.allocator->AllocateSparseMemory(tile_requirements, memory, offset);
-                if (allocation == VK_NULL_HANDLE) {
-                    LOG_WARNING(Render_Vulkan, "Sparse tiled image {:#x}: out of device memory",
-                                gpu_addr);
-                    roll_back();
-                    return false;
-                }
-                fresh.push_back(&allocation);
-                s.bound_bytes += tile;
-                const u32 x = tx * s.tile_width;
-                const u32 y = ty * s.tile_height;
-                image_binds.push_back(VkSparseImageMemoryBind{
-                    .subresource{
-                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .mipLevel = level,
-                        .arrayLayer = 0,
-                    },
-                    .offset{static_cast<s32>(x), static_cast<s32>(y), 0},
-                    .extent{(std::min)(s.tile_width, width - x), (std::min)(s.tile_height, height - y),
-                            1},
-                    .memory = memory,
-                    .memoryOffset = offset,
-                    .flags = 0,
-                });
-            }
-        }
-    }
-    if (needs_tail && s.tail_level < s.levels && s.tail_memory == VK_NULL_HANDLE) {
-        const VkMemoryRequirements requirements{
-            .size = Common::AlignUp(s.sparse.imageMipTailSize, tile),
-            .alignment = tile,
-            .memoryTypeBits = s.requirements.memoryTypeBits,
-        };
-        VkDeviceMemory memory{};
-        VkDeviceSize offset{};
-        s.tail_memory = s.allocator->AllocateSparseMemory(requirements, memory, offset);
-        if (s.tail_memory == VK_NULL_HANDLE) {
-            LOG_WARNING(Render_Vulkan, "Sparse tiled image {:#x}: out of device memory for the mip "
-                                       "tail",
-                        gpu_addr);
-            roll_back();
-            return false;
-        }
-        fresh_tail = true;
-        s.bound_bytes += requirements.size;
-        opaque_binds.push_back(VkSparseMemoryBind{
-            .resourceOffset = s.sparse.imageMipTailOffset,
-            .size = s.sparse.imageMipTailSize,
-            .memory = memory,
-            .memoryOffset = offset,
-            .flags = 0,
-        });
-    }
-    if (image_binds.empty() && opaque_binds.empty()) {
-        return true;
-    }
-    const VkSparseImageMemoryBindInfo image_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(image_binds.size()),
-        .pBinds = image_binds.data(),
-    };
-    const VkSparseImageOpaqueMemoryBindInfo opaque_bind_info{
-        .image = *original_image,
-        .bindCount = static_cast<u32>(opaque_binds.size()),
-        .pBinds = opaque_binds.data(),
-    };
-    const VkBindSparseInfo bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .bufferBindCount = 0,
-        .pBufferBinds = nullptr,
-        .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
-        .pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_bind_info,
-        .imageBindCount = image_binds.empty() ? 0U : 1U,
-        .pImageBinds = image_binds.empty() ? nullptr : &image_bind_info,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
-    };
-    // Bound before the command buffer that uploads the blocks is submitted (as BindLayers).
-    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-    });
-    VkResult result;
-    {
-        std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
-    }
-    if (result != VK_SUCCESS) {
-        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding failed ({})", gpu_addr,
-                  static_cast<int>(result));
-        roll_back();
-        return false;
-    }
-    fence.Wait();
     return true;
 }
 
@@ -4173,11 +3755,25 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {
     if (!image.ExchangeInitialization()) {
+        const bool is_unbacked = True(image.flags & ImageFlagBits::Unbacked);
+        const bool is_compressed =
+            VideoCore::Surface::IsPixelFormatBCn(image.info.format) ||
+            (VideoCore::Surface::IsPixelFormatASTC(image.info.format) &&
+             !WillUseAcceleratedAstcDecode(device, image.info));
+        const bool should_clear_color =
+            !is_unbacked && !is_compressed &&
+            (image.AspectMask() & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+
+        const VkAccessFlags dst_access_mask =
+            should_clear_color
+                ? static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_WRITE_BIT)
+                : static_cast<VkAccessFlags>(VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+
         VkImageMemoryBarrier barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_NONE,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = dst_access_mask,
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -4192,9 +3788,25 @@ void TextureCacheRuntime::TransitionImageLayout(Image& image) {
             },
         };
         scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([barrier](vk::CommandBuffer cmdbuf) {
-            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, barrier);
+        scheduler.Record([barrier, should_clear_color](vk::CommandBuffer cmdbuf) {
+            if (should_clear_color) {
+                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+                cmdbuf.ClearColorImage(barrier.image, VK_IMAGE_LAYOUT_GENERAL, {},
+                                       barrier.subresourceRange);
+                VkImageMemoryBarrier post_clear_barrier = barrier;
+                post_clear_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                post_clear_barrier.dstAccessMask =
+                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                post_clear_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                post_clear_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0,
+                                       post_clear_barrier);
+            } else {
+                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                                       vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, barrier);
+            }
         });
     }
 }
