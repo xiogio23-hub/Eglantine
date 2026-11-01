@@ -620,16 +620,12 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     sets_per_pool = 64;
-    // AMD GCN4 and older are told apart by their lack of float16, read before float16 is turned
-    // off for newer AMD drivers below: checked after that, every AMD GPU looked like GCN4 and lost
-    // VK_EXT_sampler_filter_minmax (an RDNA3 Radeon 780M logged it).
-    const bool amd_gcn4_or_older = is_amd && !features.shader_float16_int8.shaderFloat16;
     if (is_amd_driver) {
         // AMD drivers need a higher amount of Sets per Pool in certain circumstances like in XC2.
         sets_per_pool = 96;
 
         // Disable VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT on AMD GCN4 and lower as it is broken.
-        if (amd_gcn4_or_older) {
+        if (!features.shader_float16_int8.shaderFloat16) {
             LOG_WARNING(Render_Vulkan,
                         "AMD GCN4 and earlier have broken VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT");
             has_broken_cube_compatibility = true;
@@ -645,7 +641,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     if (extensions.sampler_filter_minmax && is_amd) {
         // Disable ext_sampler_filter_minmax on AMD GCN4 and lower as it is broken.
-        if (amd_gcn4_or_older) {
+        if (!features.shader_float16_int8.shaderFloat16) {
             LOG_WARNING(Render_Vulkan,
                         "AMD GCN4 and earlier have broken VK_EXT_sampler_filter_minmax");
             RemoveExtension(extensions.sampler_filter_minmax,
@@ -654,9 +650,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     if (features.shader_float16_int8.shaderFloat16 && is_intel_windows) {
-        // Intel's compiler crashes when using fp16 on Astral Chain, disable it for the time being.
-        LOG_WARNING(Render_Vulkan, "Intel has broken float16 math");
-        features.shader_float16_int8.shaderFloat16 = false;
+        // Keep native FP16 enabled on Intel Arc (Xe/Xe2) GPUs for Switch 2 shaders (HFMA2).
+        LOG_INFO(Render_Vulkan, "Keeping native float16 math enabled on Intel Windows driver");
     }
 
     has_broken_compute =
@@ -1308,13 +1303,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
         features.extended_dynamic_state3.extendedDynamicState3ColorBlendEquation = false;
     }
 
-    // Intel Windows < 27.20.100.0: Broken VertexInputDynamicState
-    // Same for NVIDIA Proprietary < 580.119.02, unknown when VIDS was first NOT broken
-    // Disable VertexInputDynamicState on old Intel Windows drivers
+    // Disable VertexInputDynamicState only on older NVIDIA drivers (< 580.119.02).
+    // Modern Intel Arc Windows drivers (101.xxxx) pack driverVersion as (major << 14) | minor,
+    // which previously caused VK_MAKE_API_VERSION(27, 20, 100, 0) to always evaluate to true.
     if (extensions.vertex_input_dynamic_state) {
         const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
-        || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && version < VK_MAKE_API_VERSION(580, 119, 02, 0))) {
+        if (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && version < VK_MAKE_API_VERSION(580, 119, 02, 0)) {
             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
         }
@@ -1734,8 +1728,8 @@ void Device::CollectPhysicalMemoryInfo() {
         const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
         device_access_memory -= reserve_memory;
         if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive) {
-            // Account for resolution scaling in memory limits
-            const size_t normal_memory = 6_GiB;
+            // Account for resolution scaling in memory limits (allow up to 10 GiB base on >=11 GiB cards)
+            const size_t normal_memory = local_memory >= 11_GiB ? 10_GiB : 6_GiB;
             const size_t scaler_memory = 1_GiB * Settings::values.resolution_info.ScaleUp(1);
             device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
         }
